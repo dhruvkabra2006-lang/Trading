@@ -1,6 +1,9 @@
 name: Place Trade
 
 on:
+  push:
+    paths:
+      - 'trigger.json'
   workflow_dispatch:
     inputs:
       symbol:
@@ -19,6 +22,9 @@ jobs:
   trade:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Place order
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
@@ -29,12 +35,20 @@ jobs:
 
           key = os.environ["ALPACA_API_KEY"]
           secret = os.environ["ALPACA_API_SECRET"]
-          url = "https://paper-api.alpaca.markets/v2/orders"
 
+          # Read trade params from trigger.json
+          with open("trigger.json") as f:
+              params = json.load(f)
+
+          symbol = params["symbol"]
+          qty = str(params["qty"])
+          side = params["side"]
+
+          url = "https://paper-api.alpaca.markets/v2/orders"
           order = {
-              "symbol": "${{ github.event.inputs.symbol }}",
-              "qty": "${{ github.event.inputs.qty }}",
-              "side": "${{ github.event.inputs.side }}",
+              "symbol": symbol,
+              "qty": qty,
+              "side": side,
               "type": "market",
               "time_in_force": "day"
           }
