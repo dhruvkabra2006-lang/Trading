@@ -1,0 +1,55 @@
+name: Place Trade
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: 'Stock symbol (e.g. AAPL)'
+        required: true
+      qty:
+        description: 'Number of shares'
+        required: true
+        default: '1'
+      side:
+        description: 'buy or sell'
+        required: true
+        default: 'buy'
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Place order
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+        run: |
+          python3 - <<'EOF'
+          import urllib.request, json, os
+
+          key = os.environ["ALPACA_API_KEY"]
+          secret = os.environ["ALPACA_API_SECRET"]
+          url = "https://paper-api.alpaca.markets/v2/orders"
+
+          order = {
+              "symbol": "${{ github.event.inputs.symbol }}",
+              "qty": "${{ github.event.inputs.qty }}",
+              "side": "${{ github.event.inputs.side }}",
+              "type": "market",
+              "time_in_force": "day"
+          }
+
+          req = urllib.request.Request(url, json.dumps(order).encode(), method="POST")
+          req.add_header("APCA-API-KEY-ID", key)
+          req.add_header("APCA-API-SECRET-KEY", secret)
+          req.add_header("Content-Type", "application/json")
+
+          with urllib.request.urlopen(req) as resp:
+              result = json.loads(resp.read())
+              print(f"Order placed!")
+              print(f"  ID:     {result['id']}")
+              print(f"  Symbol: {result['symbol']}")
+              print(f"  Qty:    {result['qty']}")
+              print(f"  Side:   {result['side']}")
+              print(f"  Status: {result['status']}")
+          EOF
