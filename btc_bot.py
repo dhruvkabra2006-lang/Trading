@@ -12,16 +12,17 @@ DATA_URL   = "https://data.alpaca.markets/v1beta3/crypto/us"
 
 SYMBOL        = "BTC/USD"
 INITIAL_QTY   = 0.03          # BTC to buy on start
-STOP_LOSS_PCT = 0.10           # 10% hard floor
-TRAIL_TRIGGER = 0.10           # start trailing after +10% gain
-TRAIL_STEP    = 0.05           # move floor up every +5% gain after trigger
-TRAIL_OFFSET  = 0.05           # floor sits 5% below current peak
+STOP_LOSS_PCT = 0.02           # 2% hard floor  (tight for 5-min cycle)
+TRAIL_TRIGGER = 0.01           # start trailing after +1% gain
+TRAIL_STEP    = 0.01           # move floor up every +1% gain
+TRAIL_OFFSET  = 0.005          # floor sits 0.5% below peak  (very tight)
+PROFIT_TARGET = 0.03           # sell everything at +3% gain
 INTERVAL      = 300            # seconds between checks (5 min)
 
 # Ladder: (% drop from entry, qty to buy)
 LADDER = [
-    (-0.03, 0.01),   # -3%  → buy 0.01 BTC
-    (-0.06, 0.01),   # -6%  → buy 0.01 BTC
+    (-0.005, 0.01),  # -0.5% → buy 0.01 BTC
+    (-0.010, 0.01),  # -1.0% → buy 0.01 BTC
 ]
 
 STATE_FILE = "bot_state.json"
@@ -108,7 +109,18 @@ def run():
             change_pct = (price - entry) / entry * 100
             log(f"BTC ${price:,.2f}  ({change_pct:+.2f}% from entry)  |  Floor ${state['floor']:,.2f}  |  Holding {state['total_qty']} BTC")
 
-            # ── 1. Check hard floor ────────────────────────────────────────
+            # ── 1. Check profit target ────────────────────────────────────
+            gain = (price - entry) / entry
+            if gain >= PROFIT_TARGET:
+                log(f"🟢 PROFIT TARGET +{gain*100:.2f}% hit at ${price:,.2f} — selling all {state['total_qty']} BTC")
+                order = place_order("sell", state["total_qty"])
+                log(f"Sell order → ID: {order['id']} | Status: {order['status']}")
+                state["active"] = False
+                save_state({**state, "ladder_triggered": list(state["ladder_triggered"])})
+                log("Profit target reached. Bot stopped.")
+                break
+
+            # ── 2. Check hard floor ────────────────────────────────────────
             if price <= state["floor"]:
                 log(f"🔴 FLOOR HIT at ${price:,.2f} — selling all {state['total_qty']} BTC")
                 order = place_order("sell", state["total_qty"])
@@ -118,7 +130,7 @@ def run():
                 log("Strategy complete. Bot stopped.")
                 break
 
-            # ── 2. Update trailing floor ───────────────────────────────────
+            # ── 3. Update trailing floor ───────────────────────────────────
             if price > state["peak_price"]:
                 state["peak_price"] = price
                 gain_from_entry = (price - entry) / entry
@@ -133,7 +145,7 @@ def run():
                             state["last_trail_level"] = price
                             log(f"📈 Trailing floor raised to ${new_floor:,.2f} (price at ${price:,.2f})")
 
-            # ── 3. Ladder in on dips ───────────────────────────────────────
+            # ── 4. Ladder in on dips ───────────────────────────────────────
             for (level, qty) in LADDER:
                 if level not in state["ladder_triggered"]:
                     drop = (price - entry) / entry
