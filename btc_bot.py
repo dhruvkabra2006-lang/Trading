@@ -11,21 +11,16 @@ BASE_URL   = "https://paper-api.alpaca.markets/v2"
 DATA_URL   = "https://data.alpaca.markets/v1beta3/crypto/us"
 
 SYMBOL        = "BTC/USD"
-INITIAL_QTY   = 0.03          # BTC to buy on start
-STOP_LOSS_PCT = 0.02           # 2% hard floor  (tight for 5-min cycle)
-TRAIL_TRIGGER = 0.01           # start trailing after +1% gain
-TRAIL_STEP    = 0.01           # move floor up every +1% gain
-TRAIL_OFFSET  = 0.005          # floor sits 0.5% below peak  (very tight)
-PROFIT_TARGET = 0.03           # sell everything at +3% gain
-INTERVAL      = 300            # seconds between checks (5 min)
-
-# Ladder: (% drop from entry, qty to buy)
-LADDER = [
-    (-0.005, 0.01),  # -0.5% → buy 0.01 BTC
-    (-0.010, 0.01),  # -1.0% → buy 0.01 BTC
+INITIAL_QTY   = 0.03
+PROFIT_TARGET = 0.010   # +1.0% → sell, take profit
+STOP_LOSS_PCT = 0.010   # -1.0% → sell, cut loss
+TRAIL_TRIGGER = 0.005   # +0.5% → start trailing
+TRAIL_OFFSET  = 0.003   # trail floor sits 0.3% below peak
+LADDER        = [
+    (-0.003, 0.01),     # -0.3% → buy 0.01 more BTC
+    (-0.006, 0.01),     # -0.6% → buy 0.01 more BTC
 ]
-
-STATE_FILE = "bot_state.json"
+INTERVAL = 300          # 5 minutes between checks
 
 HEADERS = {
     "APCA-API-KEY-ID":     API_KEY,
@@ -35,13 +30,16 @@ HEADERS = {
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def log(msg):
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 def get_btc_price():
-    r = requests.get(f"{DATA_URL}/latest/quotes?symbols=BTC%2FUSD", headers=HEADERS, timeout=10)
+    r = requests.get(
+        f"{DATA_URL}/latest/quotes?symbols=BTC%2FUSD",
+        headers=HEADERS, timeout=10
+    )
     r.raise_for_status()
     q = r.json()["quotes"]["BTC/USD"]
-    return (q["ap"] + q["bp"]) / 2   # mid-price
+    return (q["ap"] + q["bp"]) / 2
 
 def place_order(side, qty):
     body = {
@@ -55,115 +53,102 @@ def place_order(side, qty):
     r.raise_for_status()
     return r.json()
 
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+def get_pnl_summary(trades):
+    wins   = [t for t in trades if t["pnl"] > 0]
+    losses = [t for t in trades if t["pnl"] <= 0]
+    total  = sum(t["pnl"] for t in trades)
+    return f"{len(trades)} trades | {len(wins)}W {len(losses)}L | Total P&L: ${total:+.2f}"
 
-def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            s = json.load(f)
-            s["ladder_triggered"] = set(s.get("ladder_triggered", []))
-            return s
-    return None
+# ── Single trade cycle ────────────────────────────────────────────────────────
+def run_trade(trade_num):
+    price = get_btc_price()
+    log(f"━━ Trade #{trade_num} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    log(f"Buying {INITIAL_QTY} BTC at ${price:,.2f}")
 
-# ── Main bot ──────────────────────────────────────────────────────────────────
-def run():
-    state = load_state()
+    order = place_order("buy", INITIAL_QTY)
+    log(f"Order → {order['id']} | {order['status']}")
 
-    if state and state.get("active"):
-        log("Resuming from saved state.")
-        log(f"  Entry price : ${state['entry_price']:,.2f}")
-        log(f"  Current floor: ${state['floor']:,.2f}")
-        log(f"  Total BTC held: {state['total_qty']}")
-    else:
-        price = get_btc_price()
-        log(f"BTC price: ${price:,.2f}")
-        log(f"⚠️  NOTE: 0.03 BTC ≈ ${price * 0.03:,.2f}. Make sure your account has enough balance.")
-        log(f"Placing initial buy: {INITIAL_QTY} BTC…")
+    entry      = price
+    floor      = price * (1 - STOP_LOSS_PCT)
+    peak       = price
+    trail_on   = False
+    total_qty  = INITIAL_QTY
+    ladder_hit = set()
+    cost_basis = price * INITIAL_QTY
 
-        order = place_order("buy", INITIAL_QTY)
-        log(f"Order placed → ID: {order['id']} | Status: {order['status']}")
+    log(f"Entry ${entry:,.2f} | Stop ${floor:,.2f} | Target ${entry*(1+PROFIT_TARGET):,.2f}")
 
-        floor = price * (1 - STOP_LOSS_PCT)
-        state = {
-            "active":            True,
-            "entry_price":       price,
-            "floor":             floor,
-            "peak_price":        price,
-            "last_trail_level":  price,   # price at which we last moved the floor
-            "total_qty":         INITIAL_QTY,
-            "ladder_triggered":  set(),
-        }
-        save_state({**state, "ladder_triggered": list(state["ladder_triggered"])})
-
-        log(f"Entry: ${price:,.2f} | Stop-loss floor: ${floor:,.2f} (10% below entry)")
-
-    # ── Loop ──────────────────────────────────────────────────────────────────
-    while state["active"]:
+    while True:
         time.sleep(INTERVAL)
+        price = get_btc_price()
+        chg   = (price - entry) / entry * 100
+        log(f"BTC ${price:,.2f} ({chg:+.2f}%) | Floor ${floor:,.2f} | Qty {total_qty}")
 
+        # ── Profit target ──────────────────────────────────────────────────
+        if price >= entry * (1 + PROFIT_TARGET):
+            log(f"✅ PROFIT TARGET hit — selling {total_qty} BTC")
+            place_order("sell", total_qty)
+            pnl = (price - (cost_basis / total_qty)) * total_qty
+            log(f"P&L this trade: ${pnl:+.2f}")
+            return pnl
+
+        # ── Hard floor ────────────────────────────────────────────────────
+        if price <= floor:
+            log(f"🔴 STOP LOSS hit — selling {total_qty} BTC")
+            place_order("sell", total_qty)
+            pnl = (price - (cost_basis / total_qty)) * total_qty
+            log(f"P&L this trade: ${pnl:+.2f}")
+            return pnl
+
+        # ── Trailing floor ────────────────────────────────────────────────
+        if price > peak:
+            peak = price
+            gain = (peak - entry) / entry
+            if gain >= TRAIL_TRIGGER:
+                trail_on = True
+            if trail_on:
+                new_floor = peak * (1 - TRAIL_OFFSET)
+                if new_floor > floor:
+                    floor = new_floor
+                    log(f"📈 Trail floor → ${floor:,.2f}")
+
+        # ── Ladder in ─────────────────────────────────────────────────────
+        for (level, qty) in LADDER:
+            if level not in ladder_hit:
+                if (price - entry) / entry <= level:
+                    log(f"📉 Ladder at {level*100:.1f}% — buying {qty} BTC")
+                    place_order("buy", qty)
+                    cost_basis += price * qty
+                    total_qty   = round(total_qty + qty, 8)
+                    ladder_hit.add(level)
+                    log(f"Avg cost: ${cost_basis/total_qty:,.2f} | Total qty: {total_qty}")
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+def main():
+    log("BTC Scalping Bot started — press Ctrl+C to stop")
+    trades     = []
+    trade_num  = 1
+
+    while True:
         try:
-            price = get_btc_price()
-            entry = state["entry_price"]
-            change_pct = (price - entry) / entry * 100
-            log(f"BTC ${price:,.2f}  ({change_pct:+.2f}% from entry)  |  Floor ${state['floor']:,.2f}  |  Holding {state['total_qty']} BTC")
+            pnl = run_trade(trade_num)
+            trades.append({"num": trade_num, "pnl": pnl})
+            log(get_pnl_summary(trades))
+            trade_num += 1
+            log("Restarting in 10 seconds...")
+            time.sleep(10)
 
-            # ── 1. Check profit target ────────────────────────────────────
-            gain = (price - entry) / entry
-            if gain >= PROFIT_TARGET:
-                log(f"🟢 PROFIT TARGET +{gain*100:.2f}% hit at ${price:,.2f} — selling all {state['total_qty']} BTC")
-                order = place_order("sell", state["total_qty"])
-                log(f"Sell order → ID: {order['id']} | Status: {order['status']}")
-                state["active"] = False
-                save_state({**state, "ladder_triggered": list(state["ladder_triggered"])})
-                log("Profit target reached. Bot stopped.")
-                break
-
-            # ── 2. Check hard floor ────────────────────────────────────────
-            if price <= state["floor"]:
-                log(f"🔴 FLOOR HIT at ${price:,.2f} — selling all {state['total_qty']} BTC")
-                order = place_order("sell", state["total_qty"])
-                log(f"Sell order → ID: {order['id']} | Status: {order['status']}")
-                state["active"] = False
-                save_state({**state, "ladder_triggered": list(state["ladder_triggered"])})
-                log("Strategy complete. Bot stopped.")
-                break
-
-            # ── 3. Update trailing floor ───────────────────────────────────
-            if price > state["peak_price"]:
-                state["peak_price"] = price
-                gain_from_entry = (price - entry) / entry
-
-                if gain_from_entry >= TRAIL_TRIGGER:
-                    # Move floor up every TRAIL_STEP above the last trail level
-                    gain_from_last = (price - state["last_trail_level"]) / state["last_trail_level"]
-                    if gain_from_last >= TRAIL_STEP or state["last_trail_level"] == entry:
-                        new_floor = price * (1 - TRAIL_OFFSET)
-                        if new_floor > state["floor"]:
-                            state["floor"] = new_floor
-                            state["last_trail_level"] = price
-                            log(f"📈 Trailing floor raised to ${new_floor:,.2f} (price at ${price:,.2f})")
-
-            # ── 4. Ladder in on dips ───────────────────────────────────────
-            for (level, qty) in LADDER:
-                if level not in state["ladder_triggered"]:
-                    drop = (price - entry) / entry
-                    if drop <= level:
-                        log(f"📉 Ladder in at {level*100:.0f}% drop — buying {qty} BTC at ${price:,.2f}")
-                        order = place_order("buy", qty)
-                        log(f"Buy order → ID: {order['id']} | Status: {order['status']}")
-                        state["total_qty"] = round(state["total_qty"] + qty, 8)
-                        state["ladder_triggered"].add(level)
-                        log(f"Total BTC held: {state['total_qty']}")
-
-            save_state({**state, "ladder_triggered": list(state["ladder_triggered"])})
-
+        except KeyboardInterrupt:
+            log("Bot stopped by user.")
+            if trades:
+                log(get_pnl_summary(trades))
+            break
         except requests.exceptions.RequestException as e:
-            log(f"⚠️  Network error: {e} — will retry next interval")
+            log(f"⚠️  Network error: {e} — retrying in 30s")
+            time.sleep(30)
         except Exception as e:
-            log(f"❌ Unexpected error: {e}")
-
+            log(f"❌ Error: {e} — retrying in 30s")
+            time.sleep(30)
 
 if __name__ == "__main__":
-    run()
+    main()
