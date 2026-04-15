@@ -5,22 +5,23 @@ import requests
 from datetime import datetime
 
 # ── Config ────────────────────────────────────────────────────────────────────
-API_KEY    = os.getenv("ALPACA_API_KEY",    "PKAZIDZOGFGR2FFN7X3QGB5IJN")
-API_SECRET = os.getenv("ALPACA_API_SECRET", "4juc9gRTRkxH2PifbEuRmC7oYnqzKDLGQf5HnFY2H7Fn")
+API_KEY    = os.getenv("ALPACA_API_KEY",    "PKGJDEV2I4ZGMQSITU6YNXM3MB")
+API_SECRET = os.getenv("ALPACA_API_SECRET", "GtbTTT7yozTz32YKtiPqRiEVEf7pJDE7P5zJ1dYoaofQ")
 BASE_URL   = "https://paper-api.alpaca.markets/v2"
 DATA_URL   = "https://data.alpaca.markets/v1beta3/crypto/us"
 
+# $100 budget — at ~$85k BTC, 0.001 BTC ≈ $85 (leaves ~$15 for ladder buys)
 SYMBOL        = "BTC/USD"
-INITIAL_QTY   = 0.03
-PROFIT_TARGET = 0.010   # +1.0% → sell, take profit
-STOP_LOSS_PCT = 0.010   # -1.0% → sell, cut loss
-TRAIL_TRIGGER = 0.005   # +0.5% → start trailing
-TRAIL_OFFSET  = 0.003   # trail floor sits 0.3% below peak
+INITIAL_QTY   = 0.001              # ~$85 at current prices
+PROFIT_TARGET = 0.010              # +1.0% → sell, take profit
+STOP_LOSS_PCT = 0.010              # -1.0% → sell, cut loss
+TRAIL_TRIGGER = 0.005              # +0.5% → start trailing
+TRAIL_OFFSET  = 0.003              # trail floor sits 0.3% below peak
 LADDER        = [
-    (-0.003, 0.01),     # -0.3% → buy 0.01 more BTC
-    (-0.006, 0.01),     # -0.6% → buy 0.01 more BTC
+    (-0.003, 0.0001),              # -0.3% → buy 0.0001 BTC (~$8.50)
+    (-0.006, 0.0001),              # -0.6% → buy 0.0001 BTC (~$8.50)
 ]
-INTERVAL = 300          # 5 minutes between checks
+INTERVAL = 300                     # 5 minutes between checks
 
 HEADERS = {
     "APCA-API-KEY-ID":     API_KEY,
