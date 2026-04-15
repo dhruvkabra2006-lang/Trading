@@ -31,8 +31,8 @@ DATA_URL   = "https://data.alpaca.markets/v1beta3/crypto/us"
 STARTING_BANKROLL  = 100.00
 KELLY_MULTIPLIER   = 0.5
 MAX_POSITION_PCT   = 0.10
-MIN_EDGE_THRESHOLD = 0.05
-MAX_SPREAD_PCT     = 0.001
+MIN_EDGE_THRESHOLD = 0.01     # lowered: 1% edge to enter (was 5%)
+MAX_SPREAD_PCT     = 0.005    # widened: 0.5% spread allowed (was 0.1%)
 MAX_DRAWDOWN       = 0.20
 DAILY_LOSS_LIMIT   = 10.00
 MAX_OPEN_POSITIONS = 1
@@ -248,10 +248,6 @@ def run_trade(trade_num, high_water, daily_start):
 
     if abs(edge) < MIN_EDGE_THRESHOLD:
         log(f"⏸  Edge {abs(edge)*100:.2f}% < {MIN_EDGE_THRESHOLD*100:.0f}% threshold — skip")
-        return None, high_water, daily_start
-
-    if edge < 0:
-        log("⏸  Bearish momentum — no long entry")
         return None, high_water, daily_start
 
     passed, gates, qty = run_risk_gates(edge, ask, bid, bankroll,
