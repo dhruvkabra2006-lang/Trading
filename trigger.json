@@ -1,5 +1,3 @@
 {
-  "symbol": "TSLA",
-  "qty": 1,
-  "side": "buy"
+  "action": "close_all"
 }
