@@ -22,8 +22,8 @@ import os, time, json, signal, atexit, logging, requests
 from datetime import datetime, timezone
 
 # ── Credentials ───────────────────────────────────────────────────────────────
-API_KEY    = os.getenv("ALPACA_API_KEY",    "PKGJDEV2I4ZGMQSITU6YNXM3MB")
-API_SECRET = os.getenv("ALPACA_API_SECRET", "GtbTTT7yozTz32YKtiPqRiEVEf7pJDE7P5zJ1dYoaofQ")
+API_KEY    = os.getenv("ALPACA_API_KEY",    "PKFONBT5QBRQWB2ZEBRUYMVFKU")
+API_SECRET = os.getenv("ALPACA_API_SECRET", "CP8iWbww72M8fzacB6M7S7bRQZ7z6agJ8LG11UPKyeDB")
 BASE_URL   = "https://paper-api.alpaca.markets/v2"
 DATA_URL   = "https://data.alpaca.markets/v1beta3/crypto/us"
 
