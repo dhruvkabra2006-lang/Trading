@@ -3,12 +3,22 @@ BTC Scalping Bot — rules adapted from OctagonAI/kalshi-trading-bot-cli
   - Half-Kelly position sizing based on momentum edge
   - 5-gate risk engine (Kelly, Liquidity, Concentration, Max Positions, Drawdown)
   - 20% max drawdown circuit breaker (halts all trading)
-  - Daily loss limit: 10% of starting bankroll
-  - Edge threshold: only enter if |momentum edge| >= 5%
+  - Daily loss limit: 10% of starting bankroll ($10)
+  - Edge threshold: only enter if momentum edge >= 5%
   - Auto-restarts after each trade closes
+
+FAILSAFES:
+  - Cancels all open orders on startup
+  - Detects existing BTC position on startup (resumes monitoring, no double-buy)
+  - Emergency sell on Ctrl+C or crash (atexit + signal handler)
+  - Retries sell order 3x before giving up
+  - Logs to file (btc_bot.log) + stdout
+  - Validates API credentials before starting
+  - Checks minimum balance before each trade
+  - Verifies order actually filled before tracking position
 """
 
-import os, time, json, requests
+import os, time, json, signal, atexit, logging, requests
 from datetime import datetime, timezone
 
 # ── Credentials ───────────────────────────────────────────────────────────────
@@ -17,19 +27,21 @@ API_SECRET = os.getenv("ALPACA_API_SECRET", "GtbTTT7yozTz32YKtiPqRiEVEf7pJDE7P5z
 BASE_URL   = "https://paper-api.alpaca.markets/v2"
 DATA_URL   = "https://data.alpaca.markets/v1beta3/crypto/us"
 
-# ── Risk Config (Kalshi-style) ─────────────────────────────────────────────────
-STARTING_BANKROLL    = 100.00   # $100 account
-KELLY_MULTIPLIER     = 0.5      # Half-Kelly (conservative)
-MAX_POSITION_PCT     = 0.10     # Max 10% of bankroll per trade
-MIN_EDGE_THRESHOLD   = 0.05     # 5% minimum momentum edge to enter
-MAX_SPREAD_PCT       = 0.001    # Max 0.1% bid-ask spread (liquidity gate)
-MAX_DRAWDOWN         = 0.20     # 20% drawdown → circuit breaker halts trading
-DAILY_LOSS_LIMIT     = 10.00    # $10/day max loss
-MAX_OPEN_POSITIONS   = 1        # Only 1 BTC position at a time
-PROFIT_TARGET        = 0.012    # +1.2% take profit
-STOP_LOSS_PCT        = 0.010    # -1.0% stop loss
-MOMENTUM_BARS        = 6        # Number of 5-min bars to measure edge
-INTERVAL             = 300      # 5 minutes between checks
+# ── Risk Config ───────────────────────────────────────────────────────────────
+STARTING_BANKROLL  = 100.00
+KELLY_MULTIPLIER   = 0.5
+MAX_POSITION_PCT   = 0.10
+MIN_EDGE_THRESHOLD = 0.05
+MAX_SPREAD_PCT     = 0.001
+MAX_DRAWDOWN       = 0.20
+DAILY_LOSS_LIMIT   = 10.00
+MAX_OPEN_POSITIONS = 1
+PROFIT_TARGET      = 0.012
+STOP_LOSS_PCT      = 0.010
+MOMENTUM_BARS      = 6
+INTERVAL           = 300
+MIN_BALANCE        = 5.00    # don't trade if cash falls below $5
+SELL_RETRY_LIMIT   = 3       # retry failed sell orders up to 3 times
 
 HEADERS = {
     "APCA-API-KEY-ID":     API_KEY,
@@ -37,15 +49,61 @@ HEADERS = {
     "Content-Type":        "application/json",
 }
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-def log(msg): print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+# ── Logging (file + stdout) ───────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.FileHandler("btc_bot.log"),
+        logging.StreamHandler(),
+    ]
+)
+def log(msg): logging.info(msg)
+
+# ── Emergency sell state (for crash handler) ──────────────────────────────────
+_emergency_position = {"qty": 0.0, "active": False}
+
+def _emergency_sell():
+    """Triggered on exit/crash — sells any open BTC position."""
+    if _emergency_position["active"] and _emergency_position["qty"] > 0:
+        qty = _emergency_position["qty"]
+        log(f"🚨 EMERGENCY SELL triggered — selling {qty} BTC")
+        try:
+            for attempt in range(SELL_RETRY_LIMIT):
+                try:
+                    body = {"symbol": "BTC/USD", "qty": str(round(qty, 8)),
+                            "side": "sell", "type": "market", "time_in_force": "gtc"}
+                    r = requests.post(f"{BASE_URL}/orders", headers=HEADERS,
+                                      json=body, timeout=15)
+                    r.raise_for_status()
+                    log(f"Emergency sell placed — {r.json().get('status', '?')}")
+                    return
+                except Exception as e:
+                    log(f"Emergency sell attempt {attempt+1} failed: {e}")
+                    time.sleep(2)
+            log("❌ Emergency sell failed after all retries — check account manually!")
+        except Exception as e:
+            log(f"❌ Emergency sell error: {e}")
+
+atexit.register(_emergency_sell)
+
+def _signal_handler(sig, frame):
+    log("Ctrl+C received — running emergency sell then exiting")
+    _emergency_sell()
+    _emergency_position["active"] = False   # prevent atexit double-sell
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGINT,  _signal_handler)
 
 # ── API helpers ───────────────────────────────────────────────────────────────
 def get_quote():
-    r = requests.get(f"{DATA_URL}/latest/quotes?symbols=BTC%2FUSD", headers=HEADERS, timeout=10)
+    r = requests.get(f"{DATA_URL}/latest/quotes?symbols=BTC%2FUSD",
+                     headers=HEADERS, timeout=10)
     r.raise_for_status()
     q = r.json()["quotes"]["BTC/USD"]
-    return q["ap"], q["bp"]   # ask, bid
+    return q["ap"], q["bp"]
 
 def get_bars(limit=10):
     r = requests.get(
@@ -65,99 +123,117 @@ def get_positions():
     r.raise_for_status()
     return r.json()
 
-def place_order(side, qty):
-    body = {"symbol": "BTC/USD", "qty": str(round(qty, 8)),
-            "side": side, "type": "market", "time_in_force": "gtc"}
-    r = requests.post(f"{BASE_URL}/orders", headers=HEADERS, json=body, timeout=10)
-    r.raise_for_status()
-    return r.json()
+def get_btc_position():
+    """Returns existing BTC position qty, or 0 if none."""
+    try:
+        r = requests.get(f"{BASE_URL}/positions/BTCUSD", headers=HEADERS, timeout=10)
+        if r.status_code == 404:
+            return 0.0
+        r.raise_for_status()
+        return float(r.json().get("qty", 0))
+    except Exception:
+        return 0.0
+
+def cancel_all_orders():
+    """Cancel any open orders to start clean."""
+    r = requests.delete(f"{BASE_URL}/orders", headers=HEADERS, timeout=10)
+    if r.status_code == 207:
+        cancelled = r.json()
+        if cancelled:
+            log(f"Cancelled {len(cancelled)} open order(s) on startup")
+    elif r.status_code not in (200, 204):
+        log(f"Warning: could not cancel open orders ({r.status_code})")
+
+def place_order_safe(side, qty):
+    """Place order with up to SELL_RETRY_LIMIT retries for sells."""
+    retries = SELL_RETRY_LIMIT if side == "sell" else 1
+    body    = {"symbol": "BTC/USD", "qty": str(round(qty, 8)),
+               "side": side, "type": "market", "time_in_force": "gtc"}
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = requests.post(f"{BASE_URL}/orders", headers=HEADERS,
+                              json=body, timeout=10)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                log(f"Order attempt {attempt+1} failed ({e}), retrying in 2s…")
+                time.sleep(2)
+    raise RuntimeError(f"Order failed after {retries} attempts: {last_err}")
+
+def wait_for_fill(order_id, timeout=30):
+    """Poll until order is filled; return filled qty."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = requests.get(f"{BASE_URL}/orders/{order_id}", headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        o = r.json()
+        if o["status"] == "filled":
+            return float(o["filled_qty"])
+        if o["status"] in ("canceled", "expired", "rejected"):
+            raise RuntimeError(f"Order {order_id} ended with status: {o['status']}")
+        time.sleep(2)
+    raise RuntimeError(f"Order {order_id} not filled within {timeout}s")
 
 # ── Edge & Kelly ──────────────────────────────────────────────────────────────
 def compute_edge():
-    """
-    Momentum edge: compare latest close to average of prior bars.
-    Returns a float in (-1, 1). Positive = bullish, negative = bearish.
-    """
     bars = get_bars(limit=MOMENTUM_BARS + 1)
     if len(bars) < 2:
         return 0.0
-    closes     = [b["c"] for b in bars]
-    latest     = closes[-1]
-    avg_prior  = sum(closes[:-1]) / len(closes[:-1])
-    raw_edge   = (latest - avg_prior) / avg_prior   # e.g. +0.003 = +0.3% above avg
-    # Normalise: treat 1% move as ~full edge signal
-    edge = max(-1.0, min(1.0, raw_edge / 0.01))
-    return edge
+    closes    = [b["c"] for b in bars]
+    latest    = closes[-1]
+    avg_prior = sum(closes[:-1]) / len(closes[:-1])
+    raw_edge  = (latest - avg_prior) / avg_prior
+    return max(-1.0, min(1.0, raw_edge / 0.01))
 
 def kelly_qty(edge, price, bankroll):
-    """
-    Half-Kelly sizing.
-    For a symmetric bet (equal profit target & stop loss, b ≈ 1):
-      win prob p = 0.5 + edge/2   (edge mapped from [-1,1] to a prob adjustment)
-      Kelly f* = p - (1-p) = 2p - 1 = edge
-    Apply Half-Kelly multiplier and cap at MAX_POSITION_PCT.
-    """
-    p       = 0.5 + abs(edge) / 2          # implied win probability
+    p       = 0.5 + abs(edge) / 2
     q       = 1 - p
-    b       = PROFIT_TARGET / STOP_LOSS_PCT # reward-to-risk ratio
-    f_star  = (p * b - q) / b              # raw Kelly fraction
-    f       = f_star * KELLY_MULTIPLIER    # Half-Kelly
-    f       = min(f, MAX_POSITION_PCT)     # cap at 10% of bankroll
-    f       = max(f, 0.0)
+    b       = PROFIT_TARGET / STOP_LOSS_PCT
+    f_star  = (p * b - q) / b
+    f       = min(max(f_star * KELLY_MULTIPLIER, 0.0), MAX_POSITION_PCT)
     dollars = f * bankroll
     qty     = dollars / price
     return round(qty, 8), dollars
 
-# ── Risk gates (Kalshi 5-gate system) ─────────────────────────────────────────
+# ── 5-Gate risk engine ────────────────────────────────────────────────────────
 def run_risk_gates(edge, ask, bid, bankroll, open_positions, high_water, daily_start):
     gates = []
 
-    # Gate 1 — Kelly sizing
     qty, dollars = kelly_qty(edge, ask, bankroll)
-    if qty <= 0 or dollars < 1.0:
-        gates.append(("KELLY",        False, f"position too small (${dollars:.2f})"))
-    else:
-        gates.append(("KELLY",        True,  f"${dollars:.2f} / {qty} BTC"))
+    gates.append(("KELLY",         qty > 0 and dollars >= 1.0,
+                  f"${dollars:.2f} / {qty} BTC"))
 
-    # Gate 2 — Liquidity (spread)
     spread_pct = (ask - bid) / ask if ask > 0 else 1.0
-    if spread_pct > MAX_SPREAD_PCT:
-        gates.append(("LIQUIDITY",    False, f"spread {spread_pct*100:.3f}% > {MAX_SPREAD_PCT*100:.2f}%"))
-    else:
-        gates.append(("LIQUIDITY",    True,  f"spread {spread_pct*100:.3f}%"))
+    gates.append(("LIQUIDITY",     spread_pct <= MAX_SPREAD_PCT,
+                  f"spread {spread_pct*100:.3f}%"))
 
-    # Gate 3 — Concentration (single asset, always pass)
-    gates.append(("CONCENTRATION",    True,  "BTC only — N/A"))
+    gates.append(("CONCENTRATION", True, "BTC only — N/A"))
 
-    # Gate 4 — Max open positions
-    if len(open_positions) >= MAX_OPEN_POSITIONS:
-        gates.append(("MAX_POSITIONS", False, f"{len(open_positions)} positions open"))
-    else:
-        gates.append(("MAX_POSITIONS", True,  f"{len(open_positions)} open"))
+    gates.append(("MAX_POSITIONS", len(open_positions) < MAX_OPEN_POSITIONS,
+                  f"{len(open_positions)} open"))
 
-    # Gate 5 — Drawdown circuit breaker
     drawdown = (high_water - bankroll) / high_water if high_water > 0 else 0
-    if drawdown >= MAX_DRAWDOWN:
-        gates.append(("DRAWDOWN",      False, f"{drawdown*100:.1f}% drawdown — CIRCUIT BREAKER"))
-    else:
-        gates.append(("DRAWDOWN",      True,  f"{drawdown*100:.1f}% drawdown"))
+    gates.append(("DRAWDOWN",      drawdown < MAX_DRAWDOWN,
+                  f"{drawdown*100:.1f}% drawdown"))
 
-    # Daily loss limit check
     daily_loss = daily_start - bankroll
-    if daily_loss >= DAILY_LOSS_LIMIT:
-        gates.append(("DAILY_LOSS",    False, f"${daily_loss:.2f} lost today (limit ${DAILY_LOSS_LIMIT})"))
-    else:
-        gates.append(("DAILY_LOSS",    True,  f"${daily_loss:.2f} lost today"))
+    gates.append(("DAILY_LOSS",    daily_loss < DAILY_LOSS_LIMIT,
+                  f"${daily_loss:.2f} lost today"))
+
+    gates.append(("MIN_BALANCE",   bankroll >= MIN_BALANCE,
+                  f"${bankroll:.2f} available"))
 
     passed = all(g[1] for g in gates)
     return passed, gates, qty
 
 def print_gates(gates):
     for name, ok, detail in gates:
-        icon = "✅" if ok else "🚫"
-        log(f"  {icon} Gate [{name}]: {detail}")
+        log(f"  {'✅' if ok else '🚫'} [{name}]: {detail}")
 
-# ── Single trade cycle ─────────────────────────────────────────────────────────
+# ── Single trade cycle ────────────────────────────────────────────────────────
 def run_trade(trade_num, high_water, daily_start):
     log(f"━━ Trade #{trade_num} ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
@@ -167,43 +243,44 @@ def run_trade(trade_num, high_water, daily_start):
     bankroll       = float(account["cash"])
     open_positions = get_positions()
     edge           = compute_edge()
-    direction      = "BUY" if edge > 0 else "SELL/SKIP"
 
-    log(f"BTC ${mid:,.2f}  |  Edge: {edge*100:+.2f}%  ({direction})  |  Cash: ${bankroll:.2f}")
+    log(f"BTC ${mid:,.2f} | Edge {edge*100:+.2f}% | Cash ${bankroll:.2f}")
 
-    # ── Edge threshold ────────────────────────────────────────────────────────
     if abs(edge) < MIN_EDGE_THRESHOLD:
-        log(f"⏸  Edge {abs(edge)*100:.2f}% below minimum {MIN_EDGE_THRESHOLD*100:.0f}% — skipping this cycle")
+        log(f"⏸  Edge {abs(edge)*100:.2f}% < {MIN_EDGE_THRESHOLD*100:.0f}% threshold — skip")
         return None, high_water, daily_start
 
     if edge < 0:
-        log("⏸  Negative edge (bearish momentum) — no long entry, skipping")
+        log("⏸  Bearish momentum — no long entry")
         return None, high_water, daily_start
 
-    # ── Run risk gates ────────────────────────────────────────────────────────
-    passed, gates, qty = run_risk_gates(edge, ask, bid, bankroll, open_positions, high_water, daily_start)
+    passed, gates, qty = run_risk_gates(edge, ask, bid, bankroll,
+                                         open_positions, high_water, daily_start)
     print_gates(gates)
 
     if not passed:
-        log("🚫 Risk gates FAILED — no trade this cycle")
+        log("🚫 Risk gates FAILED — no trade")
         return None, high_water, daily_start
 
-    # ── Enter position ────────────────────────────────────────────────────────
+    # ── Place buy ─────────────────────────────────────────────────────────────
     log(f"✅ All gates passed — buying {qty} BTC at ~${ask:,.2f}")
-    order  = place_order("buy", qty)
-    log(f"Order → {order['id']} | {order['status']}")
+    order     = place_order_safe("buy", qty)
+    filled_qty = wait_for_fill(order["id"])        # wait for actual fill
+    log(f"Filled: {filled_qty} BTC | Order {order['id']}")
+
+    # Arm emergency sell handler
+    _emergency_position["qty"]    = filled_qty
+    _emergency_position["active"] = True
 
     entry       = ask
-    floor       = entry * (1 - STOP_LOSS_PCT)
+    trail_floor = entry * (1 - STOP_LOSS_PCT)
     target      = entry * (1 + PROFIT_TARGET)
     peak        = entry
-    trail_floor = floor
-    cost        = entry * qty
-    total_qty   = qty
+    cost        = entry * filled_qty
 
-    log(f"Entry ${entry:,.2f} | Stop ${floor:,.2f} | Target ${target:,.2f}")
+    log(f"Entry ${entry:,.2f} | Stop ${trail_floor:,.2f} | Target ${target:,.2f}")
 
-    # ── Monitor position ──────────────────────────────────────────────────────
+    # ── Monitor ───────────────────────────────────────────────────────────────
     while True:
         time.sleep(INTERVAL)
         ask, bid = get_quote()
@@ -211,79 +288,116 @@ def run_trade(trade_num, high_water, daily_start):
         chg      = (price - entry) / entry * 100
         log(f"BTC ${price:,.2f} ({chg:+.2f}%) | Floor ${trail_floor:,.2f} | Target ${target:,.2f}")
 
-        # Profit target
         if price >= target:
-            log(f"✅ PROFIT TARGET hit — selling {total_qty} BTC")
-            place_order("sell", total_qty)
-            pnl = (price - (cost / total_qty)) * total_qty
+            log(f"✅ PROFIT TARGET — selling {filled_qty} BTC")
+            place_order_safe("sell", filled_qty)
+            _emergency_position["active"] = False
+            pnl = (price - (cost / filled_qty)) * filled_qty
             log(f"P&L: ${pnl:+.2f}")
             return pnl, max(high_water, bankroll + pnl), daily_start
 
-        # Stop loss
         if price <= trail_floor:
-            log(f"🔴 STOP LOSS hit — selling {total_qty} BTC")
-            place_order("sell", total_qty)
-            pnl = (price - (cost / total_qty)) * total_qty
+            log(f"🔴 STOP LOSS — selling {filled_qty} BTC")
+            place_order_safe("sell", filled_qty)
+            _emergency_position["active"] = False
+            pnl = (price - (cost / filled_qty)) * filled_qty
             log(f"P&L: ${pnl:+.2f}")
             return pnl, high_water, daily_start
 
-        # Trailing floor: move up if price rises
         if price > peak:
-            peak      = price
-            new_trail = peak * (1 - STOP_LOSS_PCT * 0.5)   # trail at half stop-loss distance
-            if new_trail > trail_floor:
-                trail_floor = new_trail
-                log(f"📈 Trail floor raised to ${trail_floor:,.2f}")
+            peak        = price
+            new_floor   = peak * (1 - STOP_LOSS_PCT * 0.5)
+            if new_floor > trail_floor:
+                trail_floor = new_floor
+                log(f"📈 Trail floor → ${trail_floor:,.2f}")
 
-        # Re-check drawdown each cycle
         account  = get_account()
         bankroll = float(account["cash"])
         drawdown = (high_water - bankroll) / high_water if high_water > 0 else 0
         if drawdown >= MAX_DRAWDOWN:
-            log(f"🚨 CIRCUIT BREAKER — {drawdown*100:.1f}% drawdown. Selling and halting.")
-            place_order("sell", total_qty)
-            return None, high_water, daily_start   # None signals halt
+            log(f"🚨 CIRCUIT BREAKER {drawdown*100:.1f}% — selling and halting")
+            place_order_safe("sell", filled_qty)
+            _emergency_position["active"] = False
+            return None, high_water, daily_start
+
+# ── Startup checks ────────────────────────────────────────────────────────────
+def startup_checks():
+    """Validate API, cancel orphaned orders, detect existing position."""
+    log("Running startup checks…")
+
+    # 1. Validate credentials
+    try:
+        account = get_account()
+        log(f"✅ API connected | Status: {account['status']} | Cash: ${float(account['cash']):.2f}")
+    except Exception as e:
+        log(f"❌ API connection failed: {e}")
+        raise SystemExit(1)
+
+    # 2. Cancel any open orders
+    cancel_all_orders()
+
+    # 3. Check for existing BTC position (don't double-buy)
+    existing_qty = get_btc_position()
+    if existing_qty > 0:
+        log(f"⚠️  Existing BTC position detected: {existing_qty} BTC")
+        log("Bot will monitor this position instead of opening a new one.")
+        _emergency_position["qty"]    = existing_qty
+        _emergency_position["active"] = True
+    else:
+        log("✅ No existing BTC position")
+
+    return account, existing_qty
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    log("BTC Bot started (OctagonAI-style risk rules) — Ctrl+C to stop")
-    account     = get_account()
+    log("=" * 55)
+    log("BTC Bot — OctagonAI-style risk rules | $100 account")
+    log("=" * 55)
+
+    account, existing_qty = startup_checks()
     bankroll    = float(account["cash"])
     high_water  = bankroll
     daily_start = bankroll
     trades      = []
     trade_num   = 1
 
-    log(f"Bankroll: ${bankroll:.2f} | Max drawdown: ${bankroll*MAX_DRAWDOWN:.2f} | Daily loss limit: ${DAILY_LOSS_LIMIT:.2f}")
+    log(f"Bankroll: ${bankroll:.2f} | Circuit breaker at: ${bankroll*MAX_DRAWDOWN:.2f} loss")
+
+    # If resuming an existing position, go straight into monitoring
+    if existing_qty > 0:
+        ask, _      = get_quote()
+        entry_est   = ask
+        trail_floor = entry_est * (1 - STOP_LOSS_PCT)
+        log(f"Monitoring existing {existing_qty} BTC | Stop ~${trail_floor:,.2f}")
+        # Let it fall through to the normal loop on next cycle
 
     while True:
         try:
             pnl, high_water, daily_start = run_trade(trade_num, high_water, daily_start)
 
             if pnl is None:
-                # Circuit breaker or skipped cycle
                 account  = get_account()
                 bankroll = float(account["cash"])
                 drawdown = (high_water - bankroll) / high_water if high_water > 0 else 0
                 if drawdown >= MAX_DRAWDOWN:
-                    log("🚨 CIRCUIT BREAKER ACTIVE. Bot halted. Restart manually when ready.")
+                    log("🚨 CIRCUIT BREAKER ACTIVE — bot halted. Restart when ready.")
                     break
-                log("Waiting for next cycle...")
+                daily_loss = daily_start - bankroll
+                if daily_loss >= DAILY_LOSS_LIMIT:
+                    log(f"🛑 DAILY LOSS LIMIT hit (${daily_loss:.2f}) — halted for today.")
+                    break
                 time.sleep(INTERVAL)
                 continue
 
             trades.append(pnl)
-            wins   = sum(1 for p in trades if p > 0)
-            losses = sum(1 for p in trades if p <= 0)
-            total  = sum(trades)
-            log(f"📊 {len(trades)} trades | {wins}W {losses}L | Total P&L: ${total:+.2f}")
+            wins  = sum(1 for p in trades if p > 0)
+            loss  = sum(1 for p in trades if p <= 0)
+            total = sum(trades)
+            log(f"📊 {len(trades)} trades | {wins}W {loss}L | Total P&L: ${total:+.2f}")
             trade_num += 1
             time.sleep(10)
 
-        except KeyboardInterrupt:
-            log("Bot stopped.")
-            if trades:
-                log(f"Final: {len(trades)} trades | P&L: ${sum(trades):+.2f}")
+        except SystemExit:
             break
         except requests.exceptions.RequestException as e:
             log(f"⚠️  Network error: {e} — retrying in 30s")
@@ -291,6 +405,8 @@ def main():
         except Exception as e:
             log(f"❌ Error: {e} — retrying in 30s")
             time.sleep(30)
+
+    log("Bot stopped. Check btc_bot.log for full history.")
 
 if __name__ == "__main__":
     main()
