@@ -5,18 +5,6 @@ on:
     paths:
       - 'trigger.json'
   workflow_dispatch:
-    inputs:
-      symbol:
-        description: 'Stock symbol (e.g. AAPL)'
-        required: true
-      qty:
-        description: 'Number of shares'
-        required: true
-        default: '1'
-      side:
-        description: 'buy or sell'
-        required: true
-        default: 'buy'
 
 jobs:
   trade:
@@ -25,7 +13,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Place order
+      - name: Execute trade
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_API_SECRET: ${{ secrets.ALPACA_API_SECRET }}
@@ -33,37 +21,72 @@ jobs:
           python3 - <<'EOF'
           import urllib.request, json, os
 
-          key = os.environ["ALPACA_API_KEY"]
+          key    = os.environ["ALPACA_API_KEY"]
           secret = os.environ["ALPACA_API_SECRET"]
+          base   = "https://paper-api.alpaca.markets/v2"
 
-          # Read trade params from trigger.json
+          headers = {
+              "APCA-API-KEY-ID":     key,
+              "APCA-API-SECRET-KEY": secret,
+              "Content-Type":        "application/json",
+          }
+
+          def make_request(url, method="GET", data=None):
+              body = json.dumps(data).encode() if data else None
+              req  = urllib.request.Request(url, body, method=method)
+              for k, v in headers.items():
+                  req.add_header(k, v)
+              with urllib.request.urlopen(req) as resp:
+                  return json.loads(resp.read()) if resp.read() else {}
+
           with open("trigger.json") as f:
               params = json.load(f)
 
-          symbol = params["symbol"]
-          qty = str(params["qty"])
-          side = params["side"]
+          action = params.get("action", "order")
 
-          url = "https://paper-api.alpaca.markets/v2/orders"
-          order = {
-              "symbol": symbol,
-              "qty": qty,
-              "side": side,
-              "type": "market",
-              "time_in_force": "day"
-          }
+          if action == "close_all":
+              print("Closing all positions...")
+              req = urllib.request.Request(f"{base}/positions", method="DELETE")
+              for k, v in headers.items():
+                  req.add_header(k, v)
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      results = json.loads(resp.read())
+                      if isinstance(results, list):
+                          for r in results:
+                              sym    = r.get("symbol", "?")
+                              status = r.get("status", "?")
+                              print(f"  Closed {sym} — {status}")
+                          print(f"Done. {len(results)} position(s) closed.")
+                      else:
+                          print("No open positions to close.")
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode()
+                  print(f"Error {e.code}: {body}")
 
-          req = urllib.request.Request(url, json.dumps(order).encode(), method="POST")
-          req.add_header("APCA-API-KEY-ID", key)
-          req.add_header("APCA-API-SECRET-KEY", secret)
-          req.add_header("Content-Type", "application/json")
+          else:
+              symbol = params["symbol"]
+              qty    = str(params["qty"])
+              side   = params["side"]
 
-          with urllib.request.urlopen(req) as resp:
-              result = json.loads(resp.read())
-              print(f"Order placed!")
-              print(f"  ID:     {result['id']}")
-              print(f"  Symbol: {result['symbol']}")
-              print(f"  Qty:    {result['qty']}")
-              print(f"  Side:   {result['side']}")
-              print(f"  Status: {result['status']}")
+              order = {
+                  "symbol":        symbol,
+                  "qty":           qty,
+                  "side":          side,
+                  "type":          "market",
+                  "time_in_force": "day",
+              }
+              req = urllib.request.Request(
+                  f"{base}/orders", json.dumps(order).encode(), method="POST"
+              )
+              for k, v in headers.items():
+                  req.add_header(k, v)
+              with urllib.request.urlopen(req) as resp:
+                  result = json.loads(resp.read())
+                  print(f"Order placed!")
+                  print(f"  ID:     {result['id']}")
+                  print(f"  Symbol: {result['symbol']}")
+                  print(f"  Qty:    {result['qty']}")
+                  print(f"  Side:   {result['side']}")
+                  print(f"  Status: {result['status']}")
           EOF
